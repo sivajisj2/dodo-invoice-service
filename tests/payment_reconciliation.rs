@@ -535,3 +535,68 @@ async fn timeout_recovery_resolves_to_succeeded_without_a_second_charge() {
 
     f.pool.close().await;
 }
+
+/// Two reconciliations racing on the same declined attempt must produce exactly one
+/// `invoice.payment_failed` event. The failure path has no invoice-state update to
+/// guard it, so the conditional status transition is what prevents the duplicate.
+#[tokio::test]
+async fn concurrent_reconciliation_emits_one_failure_event() {
+    let f = fixture("Concurrent Reconcile Test").await;
+
+    let provider_key = format!("dodo-concurrent-declined-{}", Uuid::new_v4());
+    let seeded = seed_psp_payment(&provider_key, "tok_card_declined", 2500).await;
+    assert_eq!(seeded["status"], "failed", "{seeded}");
+
+    let attempt_id = insert_attempt(
+        &f.pool,
+        f.business_id,
+        f.invoice_id,
+        &provider_key,
+        2500,
+        "unknown",
+    )
+    .await;
+
+    let mut handles = Vec::new();
+
+    for _ in 0..4 {
+        let app = f.app.clone();
+        let api_key = f.api_key.clone();
+
+        handles.push(tokio::spawn(async move {
+            reconcile(&app, &api_key, attempt_id).await
+        }));
+    }
+
+    for handle in handles {
+        let (status, body) = handle.await.expect("reconcile task panicked");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "failed");
+    }
+
+    let events: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM webhook_events
+        WHERE business_id = $1
+          AND event_type = 'invoice.payment_failed'
+          AND payload->'data'->>'payment_attempt_id' = $2
+        "#,
+    )
+    .bind(f.business_id)
+    .bind(attempt_id.to_string())
+    .fetch_one(&f.pool)
+    .await
+    .expect("failed to count failure events");
+
+    assert_eq!(
+        events, 1,
+        "four concurrent reconciliations must not emit duplicate failure events"
+    );
+
+    assert_eq!(attempt_status(&f.pool, attempt_id).await, "failed");
+    assert_eq!(invoice_state(&f.pool, f.invoice_id).await, "open");
+    assert_eq!(attempt_count(&f.pool, f.invoice_id).await, 1);
+
+    f.pool.close().await;
+}

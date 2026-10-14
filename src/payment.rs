@@ -148,10 +148,10 @@ pub async fn pay_invoice(
         if existing.request_hash != request_hash {
             return json_response(
                 StatusCode::CONFLICT,
-                json!({
-                    "error": "idempotency_key_reused",
-                    "message": "Use a new key for a different payment request"
-                }),
+                crate::error::error_body_with(
+                    "idempotency_key_reused",
+                    "Use a new key for a different payment request",
+                ),
             );
         }
 
@@ -209,10 +209,10 @@ pub async fn pay_invoice(
     if invoice_state != "open" {
         return json_response(
             StatusCode::CONFLICT,
-            json!({
-                "error": "invoice_not_payable",
-                "state": invoice_state
-            }),
+            crate::error::error_body_with(
+                "invoice_not_payable",
+                &format!("Invoice is in state '{invoice_state}' and cannot be paid"),
+            ),
         );
     }
 
@@ -235,10 +235,10 @@ pub async fn pay_invoice(
         Ok(true) => {
             return json_response(
                 StatusCode::CONFLICT,
-                json!({
-                    "error": "payment_requires_reconciliation",
-                    "message": "An existing payment attempt is pending or has an unknown outcome"
-                }),
+                crate::error::error_body_with(
+                    "payment_requires_reconciliation",
+                    "An existing payment attempt is pending or has an unknown outcome",
+                ),
             );
         }
         Ok(false) => {}
@@ -684,6 +684,7 @@ async fn finalize_payment(
             updated_at = NOW(),
             completed_at = NOW()
         WHERE id = $4
+          AND status IN ('pending', 'unknown')
         "#,
     )
     .bind(attempt_status)
@@ -693,12 +694,23 @@ async fn finalize_payment(
     .execute(&mut *tx)
     .await;
 
-    if let Err(error) = update_attempt {
-        tracing::error!(?error, "failed to update payment attempt");
-        return json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::error::error_body("payment_finalization_failed"),
-        );
+    let update_attempt = match update_attempt {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(?error, "failed to update payment attempt");
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::error::error_body("payment_finalization_failed"),
+            );
+        }
+    };
+
+    // A concurrent finalization already moved this attempt out of pending/unknown.
+    // Return the same result rather than writing a second webhook event for it.
+    if update_attempt.rows_affected() == 0 {
+        let _ = tx.rollback().await;
+
+        return json_response(http_status, body);
     }
 
     let update_idempotency = sqlx::query(

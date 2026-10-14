@@ -7,7 +7,7 @@ use sqlx::FromRow;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::{error::AppError, state::AppState};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -38,18 +38,18 @@ pub async fn create_endpoint(
     State(state): State<AppState>,
     Extension(business_id): Extension<Uuid>,
     Json(payload): Json<Value>,
-) -> Result<(StatusCode, Json<CreateWebhookEndpointResponse>), StatusCode> {
+) -> Result<(StatusCode, Json<CreateWebhookEndpointResponse>), AppError> {
     let url = payload
         .get("url")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|url| !url.is_empty())
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .ok_or(AppError::InvalidRequest)?;
 
-    let parsed_url = reqwest::Url::parse(url).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let parsed_url = reqwest::Url::parse(url).map_err(|_| AppError::InvalidRequest)?;
 
     if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host_str().is_none() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(AppError::InvalidRequest);
     }
 
     let endpoint_id = Uuid::new_v4();
@@ -72,7 +72,7 @@ pub async fn create_endpoint(
     .await
     .map_err(|error| {
         tracing::error!(?error, "failed to create webhook endpoint");
-        StatusCode::INTERNAL_SERVER_ERROR
+        AppError::InternalServerError
     })?;
 
     Ok((
